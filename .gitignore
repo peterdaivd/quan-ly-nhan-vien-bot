@@ -1,0 +1,39 @@
+# Môi trường Python
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Secret
+.env
+.env.*
+!.env.example
+
+# Database thật
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup database
+backups/
+backup/
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
+*.temp

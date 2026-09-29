@@ -1,0 +1,2 @@
+"""Telegram employee sales bot."""
+
