@@ -78,6 +78,7 @@ def user_summary(user: User) -> str:
 
 
 async def user_details(user: User, session: AsyncSession) -> str:
+    manager = await session.get(User, user.manager_admin_id) if user.manager_admin_id else None
     wallet = await session.scalar(select(Wallet).where(Wallet.user_id == user.id))
     revenue, commission, company = (await session.execute(select(
         func.coalesce(func.sum(DailySale.revenue), 0),
@@ -108,6 +109,8 @@ async def user_details(user: User, session: AsyncSession) -> str:
         "📊 THÔNG TIN NGƯỜI DÙNG\n\n"
         f"Họ tên: {user.display_name}\nTelegram ID: {user.telegram_id}\n"
         f"Username: {username_text(user)}\n"
+        f"Vai trò: {user.role.value}\n"
+        f"Quản lý bởi: {manager.display_name if manager else 'Không có'}\n"
         f"Số điện thoại: {user.phone_number or 'Chưa cập nhật'}\n"
         f"Ngôn ngữ: {user.language_code or 'Không xác định'}\n"
         f"Trạng thái: {status_text(user)}\n"
@@ -865,7 +868,7 @@ async def team_user_detail(callback: CallbackQuery, session: AsyncSession, setti
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Chi tiết hàng", callback_data=f"team:stock:{user.id}")],
         [InlineKeyboardButton(text="💰 Xem hoa hồng", callback_data=f"comm:user:{user.id}")],
-        [InlineKeyboardButton(text="📜 Lịch sử", callback_data=f"team:history:{user.id}")],
+        [InlineKeyboardButton(text="📜 Lịch sử theo ngày", callback_data=f"hist:m:{user.id}:t")],
     ])
     await callback.message.edit_text(text, reply_markup=keyboard); await callback.answer()
 
@@ -1178,9 +1181,10 @@ async def user_action(callback: CallbackQuery, session: AsyncSession, settings: 
         return await callback.answer("❌ Bạn không có quyền thực hiện thao tác này.", show_alert=True)
     if action == "info":
         text = await user_details(user, session)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🗑 Xóa người dùng", callback_data=f"softdelete:ask:{user.id}")
-        ]]) if user.role != UserRole.SUPER_ADMIN and not user.is_deleted else None
+        rows = [[InlineKeyboardButton(text="📜 Lịch sử theo ngày", callback_data=f"hist:m:{user.id}:a")]]
+        if user.role != UserRole.SUPER_ADMIN and not user.is_deleted:
+            rows.append([InlineKeyboardButton(text="🗑 Xóa người dùng", callback_data=f"softdelete:ask:{user.id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         await callback.message.edit_text(text, reply_markup=keyboard)
         return await callback.answer()
     else:
@@ -1241,7 +1245,12 @@ async def deleted_user_info(callback: CallbackQuery, session: AsyncSession, sett
     try: user = await session.get(User, int(callback.data.rsplit(":", 1)[1]))
     except (ValueError, AttributeError): user = None
     if not user or not user.is_deleted: return await callback.answer("Tài khoản không thuộc danh sách đã xóa.", show_alert=True)
-    await callback.message.edit_text((await user_details(user, session)) + "\n\n🔒 Chỉ đọc — tài khoản đã xóa.")
+    await callback.message.edit_text(
+        (await user_details(user, session)) + "\n\n🔒 Chỉ đọc — tài khoản đã xóa.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📜 Lịch sử theo ngày", callback_data=f"hist:m:{user.id}:d")
+        ]]),
+    )
     await callback.answer()
 
 
