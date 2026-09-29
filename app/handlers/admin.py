@@ -4,7 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from payos import AsyncPayOS
 from sqlalchemy import String, cast, func, or_, select
-from datetime import date, datetime
+from datetime import datetime
 import json
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from app.services.admin_payment_service import (amount_due_to_receiver, confirm_
     daily_settlement, paid_admin_total, paid_between, personal_company_total, received_from_staff_total)
 from app.services.payos_service import create_admin_payment_link, payos_is_configured
 from app.services.product_service import all_products, delete_or_hide_product, split_size, validate_stock_unit
+from app.services.shipping_service import get_shipping_total, vietnam_today
 from app.services.user_service import decide_reactivation, soft_delete_user
 from app.utils.money import format_commission, format_money
 from app.utils.parser import parse_commission, parse_integer
@@ -86,6 +87,8 @@ async def user_details(user: User, session: AsyncSession) -> str:
         func.coalesce(func.sum(DailySale.commission_amount), 0),
         func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user.id))).one()
+    shipping = await get_shipping_total(session, user.id)
+    amount_due = max(0, int(company) - shipping)
     stock_types = await session.scalar(select(func.count(Inventory.id)).where(
         Inventory.user_id == user.id, Inventory.current_quantity > 0
     ))
@@ -121,7 +124,8 @@ async def user_details(user: User, session: AsyncSession) -> str:
         f"\nTổng đã nạp: {format_money(wallet.total_deposited if wallet else 0)}"
         f"\nDoanh thu: {format_money(int(revenue))}"
         f"\nHoa hồng: {format_money(int(commission))}"
-        f"\nTrả công ty: {format_money(int(company))}"
+        f"\n🚚 Tiền ship: {format_money(shipping)}"
+        f"\nPhải nộp: {format_money(amount_due)}"
         f"\nSố loại đang còn tồn: {int(stock_types or 0)}"
         f"\n\nLịch sử ví gần nhất:\n{history_text}"
         f"\n\nLịch sử nạp gần nhất:\n{deposit_text}"
@@ -149,11 +153,13 @@ async def employee_totals(session: AsyncSession, user_id: int) -> dict[str, int]
         func.coalesce(func.sum(DailySale.revenue), 0),
         func.coalesce(func.sum(DailySale.commission_amount), 0), func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user_id))).one()
-    return {"revenue": int(revenue), "commission": int(commission), "company": int(company)}
+    shipping = await get_shipping_total(session, user_id)
+    return {"revenue": int(revenue), "commission": int(commission), "shipping": shipping,
+            "company": max(0, int(company) - shipping)}
 
 
 async def group_totals(session: AsyncSession, users: list[User]) -> dict[str, int]:
-    total = {"revenue": 0, "commission": 0, "company": 0}
+    total = {"revenue": 0, "commission": 0, "shipping": 0, "company": 0}
     for user in users:
         values = await employee_totals(session, user.id)
         for key in total: total[key] += values[key]
@@ -163,6 +169,7 @@ async def group_totals(session: AsyncSession, users: list[User]) -> dict[str, in
 def group_text(users: list[User], total: dict[str, int]) -> str:
     return ("📊 TỔNG HỢP NHÓM\n\n" f"Nhân viên: {len(users)}\n\n"
             f"Tổng doanh thu: {format_money(total['revenue'])}\nTổng hoa hồng: {format_money(total['commission'])}\n\n"
+            f"Tổng tiền ship: {format_money(total['shipping'])}\n"
             f"💵 Tổng tiền cần nộp Admin tổng: {format_money(total['company'])}")
 
 
@@ -386,7 +393,8 @@ async def role_action(callback: CallbackQuery, session: AsyncSession, settings: 
         ])
         text = (f"👑 {target.display_name.upper()}\n\nNhân viên: {len(users)}\n"
                 f"Doanh thu: {format_money(totals['revenue'])}\n"
-                f"Hoa hồng: {format_money(totals['commission'])}\nĐã nhận từ nhân viên: {format_money(received)}\n"
+                f"Hoa hồng: {format_money(totals['commission'])}\nTiền ship: {format_money(totals['shipping'])}\n"
+                f"Đã nhận từ nhân viên: {format_money(received)}\n"
                 f"Tiền hiện cần chuyển: {format_money(due)}\n"
                 f"Đã chuyển về Admin tổng: {format_money(paid)}")
         await callback.message.edit_text(text, reply_markup=keyboard); return await callback.answer()
@@ -842,9 +850,11 @@ async def team_summary(message: Message, session: AsyncSession, settings: Settin
     await message.answer(
         "📊 TỔNG HỢP NHÓM\n\n"
         f"👤 NHÓM NHÂN VIÊN ({len(users)})\nDoanh thu: {format_money(team['revenue'])}\n"
-        f"Hoa hồng: {format_money(team['commission'])}\nTiền còn lại: {format_money(team['company'])}\n\n"
+        f"Hoa hồng: {format_money(team['commission'])}\nTiền ship: {format_money(team['shipping'])}\n"
+        f"Tiền còn lại: {format_money(team['company'])}\n\n"
         f"👑 CÁ NHÂN ADMIN\nDoanh thu: {format_money(own['revenue'])}\n"
-        f"Hoa hồng: {format_money(own['commission'])}\nTiền còn lại: {format_money(own['company'])}\n\n"
+        f"Hoa hồng: {format_money(own['commission'])}\nTiền ship: {format_money(own['shipping'])}\n"
+        f"Tiền còn lại: {format_money(own['company'])}\n\n"
         "━━━━━━━━━━━━\n"
         f"Tổng doanh thu: {format_money(team['revenue'] + own['revenue'])}\n"
         f"Tổng hoa hồng: {format_money(team['commission'] + own['commission'])}\n"
@@ -883,7 +893,8 @@ async def team_user_detail(callback: CallbackQuery, session: AsyncSession, setti
         return await callback.answer("Bạn không quản lý nhân viên này.", show_alert=True)
     t = await employee_totals(session, user.id)
     text = (f"👤 {user.display_name.upper()}\n\nDoanh thu: {format_money(t['revenue'])}\n"
-            f"Hoa hồng: {format_money(t['commission'])}\nCòn lại trả: {format_money(t['company'])}")
+            f"Hoa hồng: {format_money(t['commission'])}\nTiền ship: {format_money(t['shipping'])}\n"
+            f"Còn lại trả: {format_money(t['company'])}")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Chi tiết hàng", callback_data=f"team:stock:{user.id}")],
         [InlineKeyboardButton(text="💰 Xem hoa hồng", callback_data=f"comm:user:{user.id}")],
@@ -937,8 +948,9 @@ async def admin_payment_preview(message: Message, session: AsyncSession, setting
     if not actor or actor.role != UserRole.ADMIN or actor.is_deleted: return await deny(message)
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await message.answer("Không tìm thấy Admin tổng nhận tiền.")
-    day = date.today(); summary = await daily_settlement(session, actor, receiver, day)
-    staff_received = max(0, summary.due - (summary.revenue - summary.commission))
+    day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
+    personal_due = max(0, summary.revenue - summary.commission - summary.shipping)
+    staff_received = max(0, summary.due - personal_due)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Nộp 10.000đ", callback_data="adminpay:create:10000"),
          InlineKeyboardButton(text="💳 Nộp 100.000đ", callback_data="adminpay:create:100000")],
@@ -952,7 +964,9 @@ async def admin_payment_preview(message: Message, session: AsyncSession, setting
         ]])
     complete = "\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if summary.remaining == 0 else ""
     await message.answer("💸 NỘP TIỀN ADMIN TỔNG\n\n"
-        f"📅 Ngày {day:%d/%m/%Y}\n\nTiền cá nhân phải nộp: {format_money(summary.revenue-summary.commission)}\n"
+        f"📅 Ngày {day:%d/%m/%Y}\n\nDoanh thu cá nhân: {format_money(summary.revenue)}\n"
+        f"Hoa hồng: {format_money(summary.commission)}\nTiền ship: {format_money(summary.shipping)}\n"
+        f"Tiền cá nhân phải nộp: {format_money(personal_due)}\n"
         f"Tiền đã thu từ nhân viên: {format_money(staff_received)}\n\n"
         f"Đã nộp Admin tổng: {format_money(summary.paid)}\nCòn lại: {format_money(summary.remaining)}{complete}", reply_markup=keyboard)
 
@@ -964,7 +978,7 @@ async def admin_payment_create(callback: CallbackQuery, session: AsyncSession, s
     if not payos_is_configured(settings): return await callback.answer("payOS chưa được cấu hình.", show_alert=True)
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await callback.answer("Không tìm thấy Admin tổng.", show_alert=True)
-    day = date.today(); summary = await daily_settlement(session, actor, receiver, day)
+    day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
     raw_amount = callback.data.rsplit(":", 1)[1]
     due = summary.remaining if raw_amount == "all" else min(summary.remaining, int(raw_amount))
     try:
@@ -996,7 +1010,7 @@ async def user_settlement_preview(message: Message, session: AsyncSession, setti
     if actor.role == UserRole.ADMIN: return await admin_payment_preview(message, session, settings)
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await message.answer("Không tìm thấy người nhận tiền.")
-    day = date.today(); summary = await daily_settlement(session, actor, receiver, day)
+    day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
     if actor.manager_admin_id:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"💸 Nộp tiền cho {receiver.display_name}", callback_data="settlement:manual:create")
@@ -1016,6 +1030,7 @@ async def user_settlement_preview(message: Message, session: AsyncSession, setti
         ]])
     await message.answer(f"💰 QUYẾT TOÁN NGÀY {day:%d/%m/%Y}\n\n"
                          f"Doanh thu: {format_money(summary.revenue)}\nHoa hồng: {format_money(summary.commission)}\n\n"
+                         f"Tiền ship: {format_money(summary.shipping)}\n"
                          f"Phải nộp: {format_money(summary.due)}\nĐã nộp: {format_money(summary.paid)}\n"
                          f"Còn lại: {format_money(summary.remaining)}\n"
                          f"Người nhận: {receiver_label}" + ("\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if summary.remaining == 0 else ""), reply_markup=keyboard)
@@ -1033,7 +1048,7 @@ async def create_manual_settlement(callback: CallbackQuery, session: AsyncSessio
     ).order_by(AdminPayment.created_at.desc()))
     if existing:
         return await callback.answer("Giao dịch đang chờ quản lý xác nhận.", show_alert=True)
-    summary = await daily_settlement(session, payer, receiver, date.today()); due = summary.remaining
+    summary = await daily_settlement(session, payer, receiver, vietnam_today()); due = summary.remaining
     try: item = await create_settlement(session, payer.id, receiver.id, due, payment_method="MANUAL")
     except ValueError as exc: return await callback.answer(str(exc), show_alert=True)
     await callback.message.edit_text("⏳ CHỜ THANH TOÁN\n\n"
@@ -1054,7 +1069,7 @@ async def create_user_payos_settlement(callback: CallbackQuery, session: AsyncSe
     if not payer or payer.role != UserRole.USER or payer.manager_admin_id is not None: return await deny(callback)
     receiver = await get_payment_receiver(session, payer)
     if not receiver: return await callback.answer("Không tìm thấy Admin tổng.", show_alert=True)
-    day = date.today(); summary = await daily_settlement(session, payer, receiver, day)
+    day = vietnam_today(); summary = await daily_settlement(session, payer, receiver, day)
     raw_amount = callback.data.rsplit(":", 1)[1]
     due = summary.remaining if raw_amount == "all" else min(summary.remaining, int(raw_amount))
     try:
@@ -1074,7 +1089,7 @@ async def create_user_payos_settlement(callback: CallbackQuery, session: AsyncSe
 async def settlement_history(callback: CallbackQuery, session: AsyncSession) -> None:
     payer = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id, User.is_deleted.is_(False)))
     if not payer: return await deny(callback)
-    day = date.today()
+    day = vietnam_today()
     rows = list((await session.scalars(select(AdminPayment).where(
         AdminPayment.payer_user_id == payer.id, AdminPayment.settlement_date == day,
     ).order_by(AdminPayment.created_at))).all())
@@ -1092,10 +1107,11 @@ async def staff_settlements(message: Message, session: AsyncSession, settings: S
     if not admin: return await deny(message)
     staff = await managed_users(session, admin)
     lines, buttons = [], []
-    day = date.today()
+    day = vietnam_today()
     for user in staff:
         summary = await daily_settlement(session, user, admin, day)
-        lines.append(f"{user.display_name}\nPhải nộp: {format_money(summary.due)}\n"
+        lines.append(f"{user.display_name}\nTiền ship: {format_money(summary.shipping)}\n"
+                     f"Phải nộp: {format_money(summary.due)}\n"
                      f"Đã nộp: {format_money(summary.paid)}\nCòn: {format_money(summary.remaining)}")
     pending = list((await session.scalars(select(AdminPayment).where(
         AdminPayment.receiver_user_id == admin.id, AdminPayment.payment_method == "MANUAL",

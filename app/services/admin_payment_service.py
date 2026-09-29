@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AdminPayment, AdminPaymentStatus, DailySale, PaymentEvent, User
 from app.services.deposit_service import generate_order_code
+from app.services.shipping_service import get_shipping_total, vietnam_today
 
 
 @dataclass(frozen=True)
@@ -31,9 +32,20 @@ class DailySettlement:
     settlement_date: date
     revenue: int
     commission: int
+    shipping: int
     due: int
     paid: int
     remaining: int
+
+
+@dataclass(frozen=True)
+class SettlementTotals:
+    start_date: date | None
+    end_date: date | None
+    revenue: int
+    commission: int
+    shipping: int
+    due: int
 
 
 async def get_payment_receiver(session: AsyncSession, user: User) -> User | None:
@@ -45,9 +57,28 @@ async def get_payment_receiver(session: AsyncSession, user: User) -> User | None
 
 
 async def personal_company_total(session: AsyncSession, user_id: int) -> int:
-    return int(await session.scalar(
+    company = int(await session.scalar(
         select(func.coalesce(func.sum(DailySale.company_amount), 0)).where(DailySale.user_id == user_id)
     ) or 0)
+    return max(0, company - await get_shipping_total(session, user_id))
+
+
+async def settlement_totals(
+    session: AsyncSession, user_id: int,
+    start_date: date | None = None, end_date: date | None = None,
+) -> SettlementTotals:
+    query = select(
+        func.coalesce(func.sum(DailySale.revenue), 0),
+        func.coalesce(func.sum(DailySale.commission_amount), 0),
+    ).where(DailySale.user_id == user_id)
+    if start_date is not None:
+        query = query.where(DailySale.sale_date >= start_date)
+    if end_date is not None:
+        query = query.where(DailySale.sale_date <= end_date)
+    revenue, commission = (await session.execute(query)).one()
+    shipping = await get_shipping_total(session, user_id, start_date, end_date)
+    due = max(0, int(revenue) - int(commission) - shipping)
+    return SettlementTotals(start_date, end_date, int(revenue), int(commission), shipping, due)
 
 
 async def paid_between(session: AsyncSession, payer_user_id: int, receiver_user_id: int) -> int:
@@ -83,7 +114,7 @@ async def create_settlement(
         payer_user_id=payer_user_id,
         receiver_user_id=receiver_user_id,
         payment_method=payment_method,
-        settlement_date=settlement_date or date.today(),
+        settlement_date=settlement_date or vietnam_today(),
         amount=amount,
         order_code=await generate_order_code(session),
         status=AdminPaymentStatus.PENDING,
@@ -126,12 +157,8 @@ async def paid_admin_total(session: AsyncSession, admin_user_id: int) -> int:
 
 
 async def daily_settlement(session: AsyncSession, user: User, receiver: User, day: date) -> DailySettlement:
-    revenue, commission, personal_due = (await session.execute(select(
-        func.coalesce(func.sum(DailySale.revenue), 0),
-        func.coalesce(func.sum(DailySale.commission_amount), 0),
-        func.coalesce(func.sum(DailySale.company_amount), 0),
-    ).where(DailySale.user_id == user.id, DailySale.sale_date == day))).one()
-    due = int(personal_due)
+    personal = await settlement_totals(session, user.id, day, day)
+    due = personal.due
     if user.role.value == "ADMIN":
         due += int(await session.scalar(select(func.coalesce(func.sum(AdminPayment.amount), 0)).where(
             AdminPayment.receiver_user_id == user.id, AdminPayment.status == AdminPaymentStatus.PAID,
@@ -141,7 +168,10 @@ async def daily_settlement(session: AsyncSession, user: User, receiver: User, da
         AdminPayment.payer_user_id == user.id, AdminPayment.receiver_user_id == receiver.id,
         AdminPayment.status == AdminPaymentStatus.PAID, AdminPayment.settlement_date == day,
     )) or 0)
-    return DailySettlement(day, int(revenue), int(commission), due, paid, max(0, due - paid))
+    return DailySettlement(
+        day, personal.revenue, personal.commission, personal.shipping,
+        due, paid, max(0, due - paid),
+    )
 
 
 async def mark_admin_link_created(session: AsyncSession, payment_id: int, link) -> AdminPayment:
@@ -184,7 +214,7 @@ async def process_successful_admin_payment(
     item.paid_at = datetime.now()
     admin = await session.get(User, item.payer_user_id or item.admin_user_id)
     receiver = await session.get(User, item.receiver_user_id) if item.receiver_user_id else None
-    summary = await daily_settlement(session, admin, receiver, item.settlement_date or date.today()) if admin and receiver else None
+    summary = await daily_settlement(session, admin, receiver, item.settlement_date or vietnam_today()) if admin and receiver else None
     outstanding = summary.remaining if summary else 0
     await session.commit()
     return AdminPaymentResult(outcome="PAID", admin_payment_id=item.id,

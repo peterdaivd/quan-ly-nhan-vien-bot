@@ -56,7 +56,8 @@ async def statistics_result(callback: CallbackQuery, session: AsyncSession, sett
         f"💵 DOANH THU — {PERIOD_NAMES[period]}\n\n"
         f"Doanh thu: {format_money(totals.revenue)}\n"
         f"💰 Hoa hồng: {format_money(totals.commission)}\n"
-        f"🏢 Trả công ty: {format_money(totals.company)}"
+        f"🚚 Tiền ship: {format_money(totals.shipping)}\n"
+        f"🏢 Phải nộp: {format_money(totals.company)}"
     )
     await callback.answer()
 

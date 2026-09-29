@@ -159,6 +159,7 @@ def create_backend_app(
                                 if summary.remaining <= 0: continue
                                 receiver_name = "Admin tổng" if receiver.role == UserRole.SUPER_ADMIN else receiver.display_name
                                 text = (f"⏰ NHẮC NỘP TIỀN\n\n📅 Ngày {day:%d/%m/%Y}\n\n"
+                                        f"🚚 Tiền ship: {format_money(summary.shipping)}\n"
                                         f"💵 Phải nộp: {format_money(summary.due)}\n✅ Đã nộp: {format_money(summary.paid)}\n"
                                         f"⏳ Còn lại: {format_money(summary.remaining)}\n\nNgười nhận: {receiver_name}\n\n"
                                         f"Vui lòng hoàn tất nộp tiền cho {receiver_name}.")

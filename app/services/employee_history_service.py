@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import DailySale, Product, StockTransaction, TransactionType, User, UserRole
+from app.services.shipping_service import get_shipping_fees_by_date, get_shipping_total
 
 
 VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -62,6 +63,8 @@ class EmployeeHistory:
     products: list[ProductHistory]
     total_revenue: int
     total_commission: int
+    total_shipping: int
+    total_due: int
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,8 @@ class DailyHistorySummary:
     sale_qty: int
     revenue: int
     commission: int
+    shipping: int
+    due: int
 
 
 def can_view_employee_history(actor: User | None, target: User | None) -> bool:
@@ -212,13 +217,20 @@ async def get_employee_history(
         item.events.sort(key=lambda event: event.created_at)
 
     ordered = sorted(products.values(), key=lambda item: (item.name.casefold(), item.product_id))
+    start_date = as_vietnam_time(start_datetime).date()
+    end_date = (as_vietnam_time(end_datetime) - timedelta(microseconds=1)).date()
+    total_revenue = sum(item.revenue for item in ordered)
+    total_commission = sum(item.commission for item in ordered)
+    total_shipping = await get_shipping_total(session, user_id, start_date, end_date)
     return EmployeeHistory(
         user=user,
-        start_date=as_vietnam_time(start_datetime).date(),
-        end_date=(as_vietnam_time(end_datetime) - timedelta(microseconds=1)).date(),
+        start_date=start_date,
+        end_date=end_date,
         products=ordered,
-        total_revenue=sum(item.revenue for item in ordered),
-        total_commission=sum(item.commission for item in ordered),
+        total_revenue=total_revenue,
+        total_commission=total_commission,
+        total_shipping=total_shipping,
+        total_due=max(0, total_revenue - total_commission - total_shipping),
     )
 
 
@@ -240,10 +252,12 @@ async def get_employee_range_summary(
     start, _ = local_day_bounds(from_date)
     _, end = local_day_bounds(to_date)
     history = await get_employee_history(session, user_id, start, end)
+    shipping_by_date = await get_shipping_fees_by_date(session, user_id, from_date, to_date)
     buckets: dict[date, dict] = {
         from_date + timedelta(days=offset): {
             "imports": {}, "sales": {}, "import_qty": 0, "sale_qty": 0,
             "revenue": 0, "commission": 0,
+            "shipping": shipping_by_date.get(from_date + timedelta(days=offset), 0),
         }
         for offset in range(inclusive_days)
     }
@@ -291,6 +305,8 @@ async def get_employee_range_summary(
             sale_qty=values["sale_qty"],
             revenue=values["revenue"],
             commission=values["commission"],
+            shipping=values["shipping"],
+            due=max(0, values["revenue"] - values["commission"] - values["shipping"]),
         )
         for day, values in buckets.items()
     ]

@@ -153,6 +153,8 @@ def render_day_pages(history: EmployeeHistory) -> list[str]:
         "", "━━━━━━━━━━━━━━", "", "📊 TỔNG KẾT NGÀY",
         f"Doanh thu: {format_money(history.total_revenue)}",
         f"Hoa hồng: {format_money(history.total_commission)}",
+        f"🚚 Tiền ship: {format_money(history.total_shipping)}",
+        f"Phải nộp: {format_money(history.total_due)}",
     ])
     return _split_message(header, lines)
 
@@ -220,6 +222,8 @@ async def show_range(
             f"Bán: {_quantity_lines(item.sales)}",
             f"Doanh thu: {format_money(item.revenue)}",
             f"Hoa hồng: {format_money(item.commission)}",
+            f"Tiền ship: {format_money(item.shipping)}",
+            f"Phải nộp: {format_money(item.due)}",
         ])
     import_days = [item for item in visible if item.imports]
     lines.extend(["", "━━━━━━━━━━━━", "", "📦 CÁC NGÀY PHÁT SINH NHẬP"])
@@ -229,7 +233,9 @@ async def show_range(
         lines.extend(["", f"{item.day:%d/%m/%Y}", _quantity_lines(item.imports, quantity_prefix="+")])
     lines.extend([
         "", "━━━━━━━━━━━━", "", f"💵 Tổng doanh thu: {format_money(history.total_revenue)}",
-        f"💰 Tổng hoa hồng: {format_money(history.total_commission)}", "", f"Trang: {page+1}/{pages}",
+        f"💰 Tổng hoa hồng: {format_money(history.total_commission)}",
+        f"🚚 Tổng tiền ship: {format_money(history.total_shipping)}",
+        f"Phải nộp: {format_money(history.total_due)}", "", f"Trang: {page+1}/{pages}",
     ])
     day_buttons = [
         InlineKeyboardButton(
@@ -400,7 +406,8 @@ async def history_to_date(message: Message, state: FSMContext, session: AsyncSes
     for item in visible:
         lines.extend(["", f"📅 {item.day:%d/%m/%Y}", f"Nhập: {_quantity_lines(item.imports)}",
                       f"Bán: {_quantity_lines(item.sales)}", f"Doanh thu: {format_money(item.revenue)}",
-                      f"Hoa hồng: {format_money(item.commission)}"])
+                      f"Hoa hồng: {format_money(item.commission)}",
+                      f"Tiền ship: {format_money(item.shipping)}", f"Phải nộp: {format_money(item.due)}"])
     lines.extend(["", "━━━━━━━━━━━━", "", "📦 CÁC NGÀY PHÁT SINH NHẬP"])
     import_days = [item for item in visible if item.imports]
     if not import_days:
@@ -409,7 +416,9 @@ async def history_to_date(message: Message, state: FSMContext, session: AsyncSes
         lines.extend(["", f"{item.day:%d/%m/%Y}", _quantity_lines(item.imports, quantity_prefix="+")])
     page_count = max(1, (len(days) + RANGE_DAYS_PER_PAGE - 1) // RANGE_DAYS_PER_PAGE)
     lines.extend(["", "━━━━━━━━━━━━", "", f"💵 Tổng doanh thu: {format_money(history.total_revenue)}",
-                  f"💰 Tổng hoa hồng: {format_money(history.total_commission)}", "", f"Trang: 1/{page_count}"])
+                  f"💰 Tổng hoa hồng: {format_money(history.total_commission)}",
+                  f"🚚 Tổng tiền ship: {format_money(history.total_shipping)}",
+                  f"Phải nộp: {format_money(history.total_due)}", "", f"Trang: 1/{page_count}"])
     buttons = [InlineKeyboardButton(text=f"{item.day:%d/%m}", callback_data=f"hist:d:{target.id}:{item.day.isoformat()}:0:{origin}") for item in visible]
     rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
     if page_count > 1:

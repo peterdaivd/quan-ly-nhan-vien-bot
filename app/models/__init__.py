@@ -171,6 +171,21 @@ class DailySale(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=func.now(), index=True)
 
 
+class DailyShippingFee(Base):
+    __tablename__ = "daily_shipping_fees"
+    __table_args__ = (
+        UniqueConstraint("user_id", "business_date", name="uq_daily_shipping_user_date"),
+        Index("ix_daily_shipping_user_date", "user_id", "business_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    business_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now, server_default=func.now())
+
+
 class Wallet(Base):
     __tablename__ = "wallets"
 
@@ -300,7 +315,7 @@ class AdminAuditLog(Base):
 
 
 __all__ = [
-    "AdminAuditLog", "AdminPayment", "AdminPaymentStatus", "Base", "CommissionType", "DailySale", "Deposit", "DepositStatus", "UserProductCommission",
+    "AdminAuditLog", "AdminPayment", "AdminPaymentStatus", "Base", "CommissionType", "DailySale", "DailyShippingFee", "Deposit", "DepositStatus", "UserProductCommission",
     "Inventory", "PaymentEvent", "PaymentOrderSequence", "PaymentReminderDelivery", "PaymentReminderSchedule", "Product", "StockTransaction",
     "TransactionType", "User", "Wallet", "WalletTransaction",
     "UserRole", "WalletTransactionType",

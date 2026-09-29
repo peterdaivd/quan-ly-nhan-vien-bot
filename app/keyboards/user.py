@@ -8,7 +8,7 @@ def user_menu(payment_label: str = "💸 Nộp tiền") -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📦 Hàng đang có"), KeyboardButton(text="💰 Doanh thu & hoa hồng")],
             [KeyboardButton(text="💳 Ví của tôi"), KeyboardButton(text="💵 Nạp tiền")],
             [KeyboardButton(text="📜 Lịch sử"), KeyboardButton(text="👤 Tài khoản")],
-            [KeyboardButton(text="💰 Hoa hồng của bạn")],
+            [KeyboardButton(text="💰 Hoa hồng của bạn"), KeyboardButton(text="🚚 Tiền ship")],
             [KeyboardButton(text=payment_label)],
         ], resize_keyboard=True,
     )

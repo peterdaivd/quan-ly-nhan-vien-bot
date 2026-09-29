@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import DailySale, Product, StockTransaction, TransactionType
+from app.services.shipping_service import get_shipping_total, vietnam_today
 
 
 class Period(str, Enum):
@@ -21,11 +22,12 @@ class Period(str, Enum):
 class Totals:
     revenue: int
     commission: int
+    shipping: int
     company: int
 
 
 def period_start(period: Period) -> date | None:
-    today = date.today()
+    today = vietnam_today()
     if period == Period.TODAY:
         return today
     if period == Period.SEVEN_DAYS:
@@ -45,7 +47,9 @@ async def sales_totals(session: AsyncSession, user_id: int, period: Period) -> T
     if start:
         query = query.where(DailySale.sale_date >= start)
     row = (await session.execute(query)).one()
-    return Totals(*(int(value) for value in row))
+    revenue, commission, company = (int(value) for value in row)
+    shipping = await get_shipping_total(session, user_id, start, vietnam_today())
+    return Totals(revenue, commission, shipping, max(0, company - shipping))
 
 
 async def transaction_history(session: AsyncSession, user_id: int, period: Period):
