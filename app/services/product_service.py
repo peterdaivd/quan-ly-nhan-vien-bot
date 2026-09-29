@@ -10,12 +10,23 @@ from app.models import DailySale, Inventory, Product, StockTransaction
 
 def split_size(value: str) -> tuple[str, str]:
     value = value.strip()
+    if value.casefold() in {"-", "không có", "khong co"}:
+        return "", ""
     if not value:
         raise ValueError("Quy cách không được để trống.")
     match = re.fullmatch(r"([0-9]+(?:[.,][0-9]+)?)\s*([^\d\s].*)", value)
     if match:
         return match.group(1).replace(",", "."), match.group(2).strip()
     return value, ""
+
+
+def validate_stock_unit(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Đơn vị quản lý không được để trống.")
+    if len(value) > 30:
+        raise ValueError("Đơn vị quản lý không được dài quá 30 ký tự.")
+    return value
 
 
 async def active_products(session: AsyncSession) -> list[Product]:

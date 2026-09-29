@@ -7,7 +7,7 @@ from app.handlers.inventory import require_employee
 from app.keyboards.inventory import period_keyboard
 from app.models import CommissionType, TransactionType, UserProductCommission
 from app.services.product_service import all_products
-from app.utils.money import format_commission
+from app.utils.money import format_commission, format_decimal
 from sqlalchemy import select
 from app.services.statistics_service import Period, sales_totals, transaction_history
 from app.services.inventory_service import list_inventory
@@ -56,8 +56,7 @@ async def statistics_result(callback: CallbackQuery, session: AsyncSession, sett
         f"💵 DOANH THU — {PERIOD_NAMES[period]}\n\n"
         f"Doanh thu: {format_money(totals.revenue)}\n"
         f"💰 Hoa hồng: {format_money(totals.commission)}\n"
-        f"🏢 Trả công ty: {format_money(totals.company)}\n"
-        f"Đã bán: {totals.quantity_sold} sản phẩm"
+        f"🏢 Trả công ty: {format_money(totals.company)}"
     )
     await callback.answer()
 
@@ -91,15 +90,16 @@ async def history_result(callback: CallbackQuery, session: AsyncSession, setting
         snapshot_unit = transaction.product_unit_snapshot
         separator = "" if snapshot_unit.casefold() in {"ml", "cl", "dl", "l", "mg", "g", "kg"} else " "
         snapshot_size = f"{transaction.product_variant_snapshot}{separator}{snapshot_unit}".strip() or product.display_size
+        stock_unit = transaction.product_stock_unit_snapshot or product.stock_unit or "sản phẩm"
         lines.append(
             f"\n{icon} {transaction.created_at:%d/%m/%Y %H:%M} — "
-            f"{snapshot_name} {snapshot_size}: {sign}{transaction.quantity}"
+            f"{snapshot_name} {snapshot_size}: {sign}{format_decimal(transaction.quantity)} {stock_unit}"
         )
     lines.extend([
         "\n━━━━━━━━━━━━", f"Doanh thu: {format_money(totals.revenue)}",
         f"Hoa hồng: {format_money(totals.commission)}",
         f"Trả công ty: {format_money(totals.company)}",
-        f"Tồn hiện tại: {sum(item.current_quantity for item in inventory)} sản phẩm",
+        f"Số loại đang còn tồn: {len(inventory)}",
     ])
     text = "\n".join(lines)
     # Telegram giới hạn 4096 ký tự; lịch sử đã giới hạn 100 dòng và chia an toàn.

@@ -15,6 +15,7 @@ from app.services.commission_service import calculate_commission_values
 class SaleResult:
     product_name: str
     display_size: str
+    stock_unit: str
     received_total: int
     quantity_sold: int
     remaining: int
@@ -78,6 +79,7 @@ async def record_sales(session: AsyncSession, user_id: int, items: list[tuple[in
                 product_name_snapshot=inventory.product.name,
                 product_variant_snapshot=inventory.product.variant,
                 product_unit_snapshot=inventory.product.unit,
+                product_stock_unit_snapshot=inventory.product.stock_unit or "",
             ))
             session.add(DailySale(
                 user_id=user_id, seller_role=seller.role, product_id=inventory.product_id, sale_date=date.today(),
@@ -88,9 +90,11 @@ async def record_sales(session: AsyncSession, user_id: int, items: list[tuple[in
                 product_name_snapshot=inventory.product.name,
                 product_variant_snapshot=inventory.product.variant,
                 product_unit_snapshot=inventory.product.unit,
+                product_stock_unit_snapshot=inventory.product.stock_unit or "",
             ))
             results.append(SaleResult(
                 product_name=inventory.product.name, display_size=inventory.product.display_size,
+                stock_unit=inventory.product.quantity_unit,
                 received_total=remaining + quantity_sold, quantity_sold=quantity_sold,
                 remaining=remaining, price=inventory.product.price,
                 revenue=revenue, commission=commission, company_amount=company_amount,

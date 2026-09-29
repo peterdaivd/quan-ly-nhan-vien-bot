@@ -58,8 +58,9 @@ def sale_quantity_text(inventory, quantity: int) -> str:
     return (
         "📦 SẢN PHẨM ĐANG CHỌN\n\n"
         f"Tên: {inventory.product.name}\nQuy cách: {inventory.product.display_size or 'Không có'}\n"
-        f"Tồn hiện tại: {inventory.current_quantity}\nGiá: {format_money(inventory.product.price)}\n"
-        f"Hoa hồng: {commission_text(inventory.product)}\n\nSố lượng đang chọn: {quantity}"
+        f"Đơn vị quản lý: {inventory.product.quantity_unit}\n"
+        f"Tồn hiện tại: {inventory.current_quantity} {inventory.product.quantity_unit}\nGiá: {format_money(inventory.product.price)}\n"
+        f"Hoa hồng: {commission_text(inventory.product)}\n\nSố lượng đang chọn: {quantity} {inventory.product.quantity_unit}"
     )
 
 
@@ -81,7 +82,7 @@ async def refresh_sale_quantity(message: Message, state: FSMContext, session: As
         await state.set_state(SaleState.menu)
         return await message.answer("Sản phẩm không thuộc tài khoản hoặc đã hết hàng.", reply_markup=operation_menu("bán"))
     if quantity > inventory.current_quantity:
-        return await message.answer(f"❌ Chỉ còn {inventory.current_quantity} sản phẩm trong kho.")
+        return await message.answer(f"❌ Chỉ còn {inventory.current_quantity} {inventory.product.quantity_unit} trong kho.")
     await state.update_data(current_quantity=quantity)
     try:
         await message.bot.delete_message(chat_id=message.chat.id, message_id=int(data["quantity_message_id"]))
@@ -94,7 +95,7 @@ async def refresh_sale_quantity(message: Message, state: FSMContext, session: As
 async def sale_cart_text(session: AsyncSession, user_id: int, cart: dict[str, int], *, final: bool = False) -> str:
     inventories = {item.id: item for item in await list_inventory(session, user_id)}
     lines = ["📊 XÁC NHẬN BÁN HÀNG" if final else "📋 DANH SÁCH ĐANG BÁN"]
-    total_quantity = total_revenue = total_commission = total_company = 0
+    total_revenue = total_commission = total_company = 0
     for index, (raw_id, raw_quantity) in enumerate(cart.items(), 1):
         inventory = inventories.get(int(raw_id)); quantity = int(raw_quantity)
         if inventory is None:
@@ -102,18 +103,19 @@ async def sale_cart_text(session: AsyncSession, user_id: int, cart: dict[str, in
         revenue = inventory.product.price * quantity
         commission = await calculate_effective_commission(session, user_id, inventory.product, quantity, revenue)
         company = revenue - commission
-        total_quantity += quantity; total_revenue += revenue
+        total_revenue += revenue
         total_commission += commission; total_company += company
         if final:
             lines.append(
-                f"\n{index}. {inventory.product.display_name}\nTồn trước: {inventory.current_quantity}\n"
-                f"Số lượng bán: {quantity}\nTồn sau: {inventory.current_quantity - quantity}\n"
+                f"\n{index}. {inventory.product.display_name}\nTồn trước: {inventory.current_quantity} {inventory.product.quantity_unit}\n"
+                f"Số lượng bán: {quantity} {inventory.product.quantity_unit}\n"
+                f"Tồn sau: {inventory.current_quantity - quantity} {inventory.product.quantity_unit}\n"
                 f"Giá bán: {format_money(inventory.product.price)}\nDoanh thu: {format_money(revenue)}\n"
                 f"Hoa hồng: {format_money(commission)}\nTrả công ty: {format_money(company)}"
             )
         else:
-            lines.append(f"\n{index}. {inventory.product.display_name} x {quantity}")
-    lines.extend(["\n━━━━━━━━━━━━", f"Tổng số loại: {len(cart)}", f"Tổng số lượng: {total_quantity}"])
+            lines.append(f"\n{index}. {inventory.product.display_name} x {quantity} {inventory.product.quantity_unit}")
+    lines.extend(["\n━━━━━━━━━━━━", f"Tổng số loại: {len(cart)}"])
     if final:
         lines.extend([
             f"\nTổng doanh thu: {format_money(total_revenue)}",
@@ -185,9 +187,16 @@ async def add_sale_item(message: Message, state: FSMContext, session: AsyncSessi
     cart = dict(data.get("cart", {})); quantity = int(data.get("current_quantity", 1))
     combined = int(cart.get(str(inventory.id), 0)) + quantity
     if combined > inventory.current_quantity:
-        return await message.answer(f"❌ Tổng đã chọn {combined}, nhưng kho chỉ còn {inventory.current_quantity}.")
+        return await message.answer(
+            f"❌ Tổng đã chọn {combined} {inventory.product.quantity_unit}, "
+            f"nhưng kho chỉ còn {inventory.current_quantity} {inventory.product.quantity_unit}."
+        )
     cart[str(inventory.id)] = combined; await state.update_data(cart=cart)
-    text = f"✅ Đã thêm sản phẩm\n\n{inventory.product.display_name}\nSố lượng thêm: {quantity}\n\n" + await sale_cart_text(session, user.id, cart)
+    text = (
+        f"✅ Đã thêm sản phẩm\n\n{inventory.product.display_name}\n"
+        f"Số lượng thêm: {quantity} {inventory.product.quantity_unit}\n\n"
+        + await sale_cart_text(session, user.id, cart)
+    )
     await show_sale_menu(message, state, text)
 
 
@@ -272,14 +281,18 @@ async def confirm_sale(message: Message, state: FSMContext, session: AsyncSessio
         await session.rollback(); await state.set_state(SaleState.menu)
         return await message.answer(str(exc), reply_markup=operation_menu("bán"))
     await state.clear(); totals = await sales_totals(session, user.id, Period.TODAY)
-    total_remaining = sum(item.current_quantity for item in await list_inventory(session, user.id))
+    result_lines = [
+        f"• {result.product_name} {result.display_size}: "
+        f"đã bán {result.quantity_sold} {result.stock_unit}, còn {result.remaining} {result.stock_unit}"
+        for result in results
+    ]
     await message.answer(
-        f"✅ ĐÃ CHỐT {sum(result.quantity_sold for result in results)} SẢN PHẨM\n\n"
+        "✅ ĐÃ CHỐT BÁN HÀNG\n\n" + "\n".join(result_lines) + "\n\n"
         f"Doanh thu phiếu: {format_money(sum(result.revenue for result in results))}\n"
         f"Hoa hồng phiếu: {format_money(sum(result.commission for result in results))}\n"
         f"Trả công ty: {format_money(sum(result.company_amount for result in results))}\n\n"
         f"💵 DOANH THU HÔM NAY: {format_money(totals.revenue)}\n"
         f"💰 HOA HỒNG HÔM NAY: {format_money(totals.commission)}\n"
-        f"📦 Tổng hàng tồn: {total_remaining} sản phẩm",
+        "📦 Tồn kho đã cập nhật theo từng sản phẩm.",
         reply_markup=user_menu(),
     )

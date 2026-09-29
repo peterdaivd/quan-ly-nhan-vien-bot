@@ -22,6 +22,7 @@ async def initialize_database(engine: AsyncEngine, super_admin_ids: frozenset[in
         await connection.run_sync(_migrate_legacy_users)
         await connection.run_sync(_migrate_legacy_payment_schema)
         await connection.run_sync(_migrate_product_catalog)
+        await connection.run_sync(_migrate_product_stock_units)
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_migrate_user_roles)
         await connection.run_sync(_migrate_commissions)
@@ -267,3 +268,23 @@ def _migrate_product_catalog(connection) -> None:
             connection.exec_driver_sql(f"UPDATE {table_name} SET {assignments}")
     connection.exec_driver_sql("PRAGMA foreign_keys=ON")
     connection.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
+
+
+def _migrate_product_stock_units(connection) -> None:
+    """Tách đơn vị quản lý khỏi quy cách bằng migration chỉ ADD COLUMN."""
+    inspector = inspect(connection)
+    tables = set(inspector.get_table_names())
+    if "products" in tables:
+        columns = {column["name"] for column in inspector.get_columns("products")}
+        if "stock_unit" not in columns:
+            connection.exec_driver_sql("ALTER TABLE products ADD COLUMN stock_unit VARCHAR(30)")
+    inspector = inspect(connection)
+    for table_name in ("stock_transactions", "daily_sales"):
+        if table_name not in tables:
+            continue
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "product_stock_unit_snapshot" not in columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE {table_name} ADD COLUMN product_stock_unit_snapshot "
+                "VARCHAR(30) NOT NULL DEFAULT ''"
+            )

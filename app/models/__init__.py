@@ -83,7 +83,10 @@ class Product(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), index=True)
     variant: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # variant + unit mô tả quy cách (ví dụ 500 + ml). stock_unit là đơn vị
+    # đếm tồn kho độc lập (chai/lon/hộp/kg...), tuyệt đối không quy đổi quantity.
     unit: Mapped[str] = mapped_column(String(30), default="", server_default="")
+    stock_unit: Mapped[str | None] = mapped_column(String(30), nullable=True)
     price: Mapped[int] = mapped_column(Integer)
     commission_type: Mapped[CommissionType] = mapped_column(SqlEnum(CommissionType))
     # Phần trăm lưu theo basis point của 1%: 10% = 1000; tiền cố định lưu VND.
@@ -107,6 +110,10 @@ class Product(Base):
     @property
     def display_name(self) -> str:
         return f"{self.name} {self.display_size}".strip()
+
+    @property
+    def quantity_unit(self) -> str:
+        return (self.stock_unit or "").strip() or "sản phẩm"
 
 
 class Inventory(Base):
@@ -137,6 +144,7 @@ class StockTransaction(Base):
     product_name_snapshot: Mapped[str] = mapped_column(String(200), default="", server_default="")
     product_variant_snapshot: Mapped[str] = mapped_column(String(100), default="", server_default="")
     product_unit_snapshot: Mapped[str] = mapped_column(String(30), default="", server_default="")
+    product_stock_unit_snapshot: Mapped[str] = mapped_column(String(30), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=func.now(), index=True)
 
 
@@ -159,6 +167,7 @@ class DailySale(Base):
     product_name_snapshot: Mapped[str] = mapped_column(String(200), default="", server_default="")
     product_variant_snapshot: Mapped[str] = mapped_column(String(100), default="", server_default="")
     product_unit_snapshot: Mapped[str] = mapped_column(String(30), default="", server_default="")
+    product_stock_unit_snapshot: Mapped[str] = mapped_column(String(30), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=func.now(), index=True)
 
 

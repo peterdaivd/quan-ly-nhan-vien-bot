@@ -11,12 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.keyboards.admin import admin_menu
-from app.models import AdminAuditLog, AdminPayment, AdminPaymentStatus, CommissionType, DailySale, Deposit, Inventory, PaymentReminderSchedule, Product, StockTransaction, TransactionType, User, UserProductCommission, UserRole, Wallet, WalletTransaction
+from app.models import AdminAuditLog, AdminPayment, AdminPaymentStatus, CommissionType, DailySale, Deposit, Inventory, PaymentReminderSchedule, Product, StockTransaction, User, UserProductCommission, UserRole, Wallet, WalletTransaction
 from app.services.admin_payment_service import (amount_due_to_receiver, confirm_manual_settlement,
     create_admin_payment, create_settlement, get_payment_receiver, mark_admin_link_created,
     daily_settlement, paid_admin_total, paid_between, personal_company_total, received_from_staff_total)
 from app.services.payos_service import create_admin_payment_link, payos_is_configured
-from app.services.product_service import all_products, delete_or_hide_product, split_size
+from app.services.product_service import all_products, delete_or_hide_product, split_size, validate_stock_unit
 from app.services.user_service import decide_reactivation, soft_delete_user
 from app.utils.money import format_commission, format_money
 from app.utils.parser import parse_commission, parse_integer
@@ -30,6 +30,7 @@ class AdminState(StatesGroup):
     searching_user = State()
     product_name = State()
     product_size = State()
+    product_stock_unit = State()
     product_price = State()
     product_commission = State()
     product_edit = State()
@@ -85,8 +86,8 @@ async def user_details(user: User, session: AsyncSession) -> str:
         func.coalesce(func.sum(DailySale.commission_amount), 0),
         func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user.id))).one()
-    stock = await session.scalar(select(func.coalesce(func.sum(Inventory.current_quantity), 0)).where(
-        Inventory.user_id == user.id
+    stock_types = await session.scalar(select(func.count(Inventory.id)).where(
+        Inventory.user_id == user.id, Inventory.current_quantity > 0
     ))
     wallet_history = list((await session.scalars(
         select(WalletTransaction).where(WalletTransaction.user_id == user.id)
@@ -121,7 +122,7 @@ async def user_details(user: User, session: AsyncSession) -> str:
         f"\nDoanh thu: {format_money(int(revenue))}"
         f"\nHoa hồng: {format_money(int(commission))}"
         f"\nTrả công ty: {format_money(int(company))}"
-        f"\nHàng tồn: {int(stock or 0)} sản phẩm"
+        f"\nSố loại đang còn tồn: {int(stock_types or 0)}"
         f"\n\nLịch sử ví gần nhất:\n{history_text}"
         f"\n\nLịch sử nạp gần nhất:\n{deposit_text}"
     )
@@ -144,19 +145,15 @@ async def managed_users(session: AsyncSession, actor: User, manager_id: int | No
 
 
 async def employee_totals(session: AsyncSession, user_id: int) -> dict[str, int]:
-    received = int(await session.scalar(select(func.coalesce(func.sum(StockTransaction.quantity), 0)).where(
-        StockTransaction.user_id == user_id, StockTransaction.transaction_type == TransactionType.IMPORT)) or 0)
-    sold, revenue, commission, company = (await session.execute(select(
-        func.coalesce(func.sum(DailySale.quantity_sold), 0), func.coalesce(func.sum(DailySale.revenue), 0),
+    revenue, commission, company = (await session.execute(select(
+        func.coalesce(func.sum(DailySale.revenue), 0),
         func.coalesce(func.sum(DailySale.commission_amount), 0), func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user_id))).one()
-    stock = int(await session.scalar(select(func.coalesce(func.sum(Inventory.current_quantity), 0)).where(Inventory.user_id == user_id)) or 0)
-    return {"received": received, "sold": int(sold), "stock": stock, "revenue": int(revenue),
-            "commission": int(commission), "company": int(company)}
+    return {"revenue": int(revenue), "commission": int(commission), "company": int(company)}
 
 
 async def group_totals(session: AsyncSession, users: list[User]) -> dict[str, int]:
-    total = {"received": 0, "sold": 0, "stock": 0, "revenue": 0, "commission": 0, "company": 0}
+    total = {"revenue": 0, "commission": 0, "company": 0}
     for user in users:
         values = await employee_totals(session, user.id)
         for key in total: total[key] += values[key]
@@ -165,7 +162,6 @@ async def group_totals(session: AsyncSession, users: list[User]) -> dict[str, in
 
 def group_text(users: list[User], total: dict[str, int]) -> str:
     return ("📊 TỔNG HỢP NHÓM\n\n" f"Nhân viên: {len(users)}\n\n"
-            f"Tổng hàng đã nhận: {total['received']}\nTổng đã bán: {total['sold']}\nTổng tồn: {total['stock']}\n\n"
             f"Tổng doanh thu: {format_money(total['revenue'])}\nTổng hoa hồng: {format_money(total['commission'])}\n\n"
             f"💵 Tổng tiền cần nộp Admin tổng: {format_money(total['company'])}")
 
@@ -388,8 +384,8 @@ async def role_action(callback: CallbackQuery, session: AsyncSession, settings: 
             [InlineKeyboardButton(text="💸 Lịch sử nộp tiền", callback_data=f"roles:payments:{target.id}")],
             [InlineKeyboardButton(text="⬅️ Quay lại", callback_data="roles:list:admins:0")],
         ])
-        text = (f"👑 {target.display_name.upper()}\n\nNhân viên: {len(users)}\nTổng hàng nhận: {totals['received']}\n"
-                f"Đã bán: {totals['sold']}\nTồn: {totals['stock']}\nDoanh thu: {format_money(totals['revenue'])}\n"
+        text = (f"👑 {target.display_name.upper()}\n\nNhân viên: {len(users)}\n"
+                f"Doanh thu: {format_money(totals['revenue'])}\n"
                 f"Hoa hồng: {format_money(totals['commission'])}\nĐã nhận từ nhân viên: {format_money(received)}\n"
                 f"Tiền hiện cần chuyển: {format_money(due)}\n"
                 f"Đã chuyển về Admin tổng: {format_money(paid)}")
@@ -449,6 +445,7 @@ def product_summary(product: Product) -> str:
     return (
         "📦 THÔNG TIN SẢN PHẨM\n\n"
         f"Tên:\n{product.name}\n\nQuy cách:\n{product.display_size or 'Không có'}\n\n"
+        f"Đơn vị quản lý:\n{product.quantity_unit}\n\n"
         f"Giá bán:\n{format_money(product.price)}\n\nHoa hồng:\n{product_commission(product)}\n\n"
         f"Trạng thái:\n{'✅ Đang hoạt động' if product.active else '🚫 Đã ẩn'}"
     )
@@ -471,7 +468,8 @@ def product_detail_keyboard(product: Product, page: int = 0, mode: str = "edit")
         [InlineKeyboardButton(text="✏️ Sửa tên", callback_data=f"prod:edit:{product.id}:name:{page}"),
          InlineKeyboardButton(text="💵 Sửa giá", callback_data=f"prod:edit:{product.id}:price:{page}")],
         [InlineKeyboardButton(text="📏 Sửa quy cách", callback_data=f"prod:edit:{product.id}:size:{page}"),
-         InlineKeyboardButton(text="💰 Sửa hoa hồng", callback_data=f"prod:edit:{product.id}:commission:{page}")],
+         InlineKeyboardButton(text="📦 Sửa đơn vị", callback_data=f"prod:edit:{product.id}:stock_unit:{page}")],
+        [InlineKeyboardButton(text="💰 Sửa hoa hồng", callback_data=f"prod:edit:{product.id}:commission:{page}")],
         [InlineKeyboardButton(text=visibility[0], callback_data=f"prod:{visibility[1]}:{product.id}"),
          InlineKeyboardButton(text="🗑 Xóa", callback_data=f"prod:delete:{product.id}")],
         [InlineKeyboardButton(text="⬅️ Quay lại", callback_data=f"prod:browse:{mode}:{page}")],
@@ -504,7 +502,7 @@ async def add_product_name(message: Message, state: FSMContext, settings: Settin
     name = (message.text or "").strip()
     if not name: return await message.answer("Tên sản phẩm không được để trống.")
     await state.update_data(name=name); await state.set_state(AdminState.product_size)
-    await message.answer("Quy cách (ví dụ: 330ml):")
+    await message.answer("Quy cách (ví dụ: 330ml; nhập - nếu không có):")
 
 
 @router.message(AdminState.product_size)
@@ -512,7 +510,16 @@ async def add_product_size(message: Message, state: FSMContext, settings: Settin
     if message.from_user.id not in settings.super_admin_ids: await state.clear(); return await deny(message)
     try: variant, unit = split_size(message.text or "")
     except ValueError as exc: return await message.answer(str(exc))
-    await state.update_data(variant=variant, unit=unit); await state.set_state(AdminState.product_price)
+    await state.update_data(variant=variant, unit=unit); await state.set_state(AdminState.product_stock_unit)
+    await message.answer("Đơn vị quản lý tồn kho (ví dụ: chai, lon, hộp, gói, kg):")
+
+
+@router.message(AdminState.product_stock_unit)
+async def add_product_stock_unit(message: Message, state: FSMContext, settings: Settings) -> None:
+    if message.from_user.id not in settings.super_admin_ids: await state.clear(); return await deny(message)
+    try: stock_unit = validate_stock_unit(message.text or "")
+    except ValueError as exc: return await message.answer(str(exc))
+    await state.update_data(stock_unit=stock_unit); await state.set_state(AdminState.product_price)
     await message.answer("Giá bán (ví dụ: 12000):")
 
 
@@ -531,7 +538,7 @@ async def add_product_commission(message: Message, state: FSMContext, session: A
     try: commission_type, commission_value = parse_commission(message.text or "")
     except ValueError as exc: return await message.answer(str(exc))
     data = await state.get_data()
-    product = Product(name=data["name"], variant=data["variant"], unit=data["unit"], price=int(data["price"]),
+    product = Product(name=data["name"], variant=data["variant"], unit=data["unit"], stock_unit=data["stock_unit"], price=int(data["price"]),
                       commission_type=commission_type, commission_value=commission_value, active=True)
     session.add(product); await session.flush()
     await audit(session, message.from_user.id, "CREATE_PRODUCT", "PRODUCT", product.id, {}, {"name": product.name})
@@ -631,6 +638,7 @@ async def product_edit_start(callback: CallbackQuery, state: FSMContext, session
     labels = {"name": ("Tên", product.name if product else ""),
               "price": ("Giá", format_money(product.price) if product else ""),
               "size": ("Quy cách", product.display_size if product else ""),
+              "stock_unit": ("Đơn vị quản lý", product.quantity_unit if product else ""),
               "commission": ("Hoa hồng", product_commission(product) if product else "")}
     if not product: return await callback.answer("Sản phẩm không tồn tại.", show_alert=True)
     if field not in labels: return await callback.answer("Trường sửa không hợp lệ.", show_alert=True)
@@ -657,6 +665,9 @@ async def product_edit_preview(message: Message, state: FSMContext, session: Asy
         elif field == "size":
             variant, unit = split_size(value)
             proposal, old_text, new_text = {"variant": variant, "unit": unit}, product.display_size, value
+        elif field == "stock_unit":
+            stock_unit = validate_stock_unit(value)
+            proposal, old_text, new_text = {"stock_unit": stock_unit}, product.quantity_unit, stock_unit
         elif field == "commission":
             commission_type, commission_value = parse_commission(value)
             proposal = {"commission_type": commission_type.value, "commission_value": commission_value}
@@ -669,7 +680,7 @@ async def product_edit_preview(message: Message, state: FSMContext, session: Asy
     warning = ""
     if field == "commission" and proposal["commission_type"] == CommissionType.FIXED_PER_ITEM.value and int(proposal["commission_value"]) >= product.price:
         warning = "\n\n⚠️ Hoa hồng đang lớn hơn hoặc bằng giá bán."
-    labels = {"name": "Tên", "price": "Giá", "size": "Quy cách", "commission": "Hoa hồng"}
+    labels = {"name": "Tên", "price": "Giá", "size": "Quy cách", "stock_unit": "Đơn vị quản lý", "commission": "Hoa hồng"}
     await state.update_data(proposal=proposal); await state.set_state(AdminState.product_edit_confirm)
     await message.answer(
         f"{labels[field]} cũ:\n{old_text}\n\n{labels[field]} mới:\n{new_text}{warning}",
@@ -684,12 +695,13 @@ async def product_edit_confirm(callback: CallbackQuery, state: FSMContext, sessi
     if not product: await state.clear(); return await callback.answer("Sản phẩm không tồn tại.", show_alert=True)
     if callback.data.endswith(":yes"):
         proposal = data.get("proposal", {})
-        old = {"name": product.name, "variant": product.variant, "unit": product.unit,
+        old = {"name": product.name, "variant": product.variant, "unit": product.unit, "stock_unit": product.stock_unit,
                "price": product.price, "commission_type": product.commission_type.value,
                "commission_value": product.commission_value}
         if "name" in proposal: product.name = proposal["name"]
         if "price" in proposal: product.price = int(proposal["price"])
         if "variant" in proposal: product.variant, product.unit = proposal["variant"], proposal.get("unit", "")
+        if "stock_unit" in proposal: product.stock_unit = proposal["stock_unit"]
         if "commission_type" in proposal:
             product.commission_type = CommissionType(proposal["commission_type"])
             product.commission_value = int(proposal["commission_value"])
@@ -806,8 +818,7 @@ async def employees_list(message: Message, session: AsyncSession, settings: Sett
     if not users: return await message.answer("Chưa có nhân viên thuộc nhóm của bạn.")
     rows = []
     for user in users:
-        t = await employee_totals(session, user.id)
-        rows.append([InlineKeyboardButton(text=f"{user.display_name} · bán {t['sold']} · tồn {t['stock']}", callback_data=f"team:user:{user.id}")])
+        rows.append([InlineKeyboardButton(text=user.display_name, callback_data=f"team:user:{user.id}")])
     await message.answer("👥 NHÂN VIÊN\n\nChọn nhân viên để xem chi tiết:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -848,8 +859,17 @@ async def team_inventory(message: Message, session: AsyncSession, settings: Sett
     users = await managed_users(session, actor)
     lines = []
     for user in users:
-        stock = int(await session.scalar(select(func.coalesce(func.sum(Inventory.current_quantity), 0)).where(Inventory.user_id == user.id)) or 0)
-        lines.append(f"• {user.display_name}: {stock} sản phẩm")
+        rows = list((await session.execute(
+            select(Inventory, Product).join(Product, Product.id == Inventory.product_id)
+            .where(Inventory.user_id == user.id, Inventory.current_quantity > 0)
+            .order_by(Product.name)
+        )).all())
+        lines.append(f"👤 {user.display_name}")
+        lines.extend(
+            f"• {product.display_name}: {item.current_quantity} {product.quantity_unit}"
+            for item, product in rows
+        )
+        if not rows: lines.append("• Không có hàng tồn.")
     await message.answer("📦 HÀNG HÓA NHÓM\n\n" + ("\n".join(lines) or "Chưa có nhân viên."))
 
 
@@ -862,8 +882,7 @@ async def team_user_detail(callback: CallbackQuery, session: AsyncSession, setti
     if not actor or not user or not can_manage_employee(actor, user):
         return await callback.answer("Bạn không quản lý nhân viên này.", show_alert=True)
     t = await employee_totals(session, user.id)
-    text = (f"👤 {user.display_name.upper()}\n\nTổng hàng nhận: {t['received']}\nĐã bán: {t['sold']}\n"
-            f"Còn tồn: {t['stock']}\nDoanh thu: {format_money(t['revenue'])}\n"
+    text = (f"👤 {user.display_name.upper()}\n\nDoanh thu: {format_money(t['revenue'])}\n"
             f"Hoa hồng: {format_money(t['commission'])}\nCòn lại trả: {format_money(t['company'])}")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Chi tiết hàng", callback_data=f"team:stock:{user.id}")],
@@ -886,7 +905,10 @@ async def team_stock(callback: CallbackQuery, session: AsyncSession, settings: S
     if not user: return await callback.answer("Bạn không quản lý nhân viên này.", show_alert=True)
     rows = list((await session.execute(select(Inventory, Product).join(Product, Product.id == Inventory.product_id)
                                       .where(Inventory.user_id == user.id).order_by(Product.name))).all())
-    text = "\n".join(f"• {product.display_name}: {item.current_quantity}" for item, product in rows) or "Chưa có hàng tồn."
+    text = "\n".join(
+        f"• {product.display_name}: {item.current_quantity} {product.quantity_unit}"
+        for item, product in rows
+    ) or "Chưa có hàng tồn."
     await callback.message.edit_text(f"📦 CHI TIẾT HÀNG — {user.display_name}\n\n{text}"[:4000]); await callback.answer()
 
 
@@ -895,9 +917,17 @@ async def team_history(callback: CallbackQuery, session: AsyncSession, settings:
     if not is_admin(callback.from_user.id, settings): return await deny(callback)
     user_id = int(callback.data.rsplit(":", 1)[1]); user = await authorized_team_user(callback, session, user_id)
     if not user: return await callback.answer("Bạn không quản lý nhân viên này.", show_alert=True)
-    rows = list((await session.scalars(select(StockTransaction).where(StockTransaction.user_id == user.id)
-                                      .order_by(StockTransaction.created_at.desc()).limit(50))).all())
-    text = "\n".join(f"• {x.created_at:%d/%m %H:%M} — {x.transaction_type.value} — {x.product_name_snapshot} — {x.quantity:+d}" for x in rows) or "Chưa có lịch sử."
+    rows = list((await session.execute(
+        select(StockTransaction, Product).join(Product, Product.id == StockTransaction.product_id)
+        .where(StockTransaction.user_id == user.id)
+        .order_by(StockTransaction.created_at.desc()).limit(50)
+    )).all())
+    text = "\n".join(
+        f"• {item.created_at:%d/%m %H:%M} — {item.transaction_type.value} — "
+        f"{item.product_name_snapshot or product.display_name} — {item.quantity:+d} "
+        f"{item.product_stock_unit_snapshot or product.stock_unit or 'sản phẩm'}"
+        for item, product in rows
+    ) or "Chưa có lịch sử."
     await callback.message.edit_text(f"📜 LỊCH SỬ — {user.display_name}\n\n{text}"[:4000]); await callback.answer()
 
 

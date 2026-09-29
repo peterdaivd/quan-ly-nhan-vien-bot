@@ -35,6 +35,7 @@ async def import_products(session: AsyncSession, user_id: int, items: list[tuple
                 product_name_snapshot=product.name,
                 product_variant_snapshot=product.variant,
                 product_unit_snapshot=product.unit,
+                product_stock_unit_snapshot=product.stock_unit or "",
             ))
             results.append(inventory)
         await session.commit()

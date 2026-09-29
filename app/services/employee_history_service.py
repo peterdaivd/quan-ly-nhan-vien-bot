@@ -27,6 +27,7 @@ class ProductHistory:
     name: str
     variant: str
     unit: str
+    stock_unit: str
     opening_stock: int = 0
     import_qty: int = 0
     sale_qty: int = 0
@@ -50,8 +51,7 @@ class ProductHistory:
 
     @property
     def quantity_unit(self) -> str:
-        # variant thường là quy cách (330ml), còn unit rỗng trong catalog cũ nghĩa là SP.
-        return self.unit.strip() or "SP"
+        return self.stock_unit.strip() or "sản phẩm"
 
 
 @dataclass
@@ -101,11 +101,12 @@ def as_vietnam_time(value: datetime) -> datetime:
     return value.astimezone(VIETNAM_TZ)
 
 
-def _snapshot(transaction) -> tuple[str, str, str]:
+def _snapshot(transaction, product: Product) -> tuple[str, str, str, str]:
     return (
-        transaction.product_name_snapshot or f"Sản phẩm #{transaction.product_id}",
-        transaction.product_variant_snapshot or "",
-        transaction.product_unit_snapshot or "",
+        transaction.product_name_snapshot or product.name,
+        transaction.product_variant_snapshot or product.variant,
+        transaction.product_unit_snapshot or product.unit,
+        transaction.product_stock_unit_snapshot or product.stock_unit or "",
     )
 
 
@@ -129,16 +130,18 @@ async def get_employee_history(
             Product.name,
             Product.variant,
             Product.unit,
+            Product.stock_unit,
         )
         .join(Product, Product.id == StockTransaction.product_id)
         .where(
             StockTransaction.user_id == user_id,
             StockTransaction.created_at < start_datetime,
         )
-        .group_by(StockTransaction.product_id, Product.name, Product.variant, Product.unit)
+        .group_by(StockTransaction.product_id, Product.name, Product.variant, Product.unit, Product.stock_unit)
     )).all()
-    stock_rows = list((await session.scalars(
-        select(StockTransaction)
+    stock_rows = list((await session.execute(
+        select(StockTransaction, Product)
+        .join(Product, Product.id == StockTransaction.product_id)
         .where(
             StockTransaction.user_id == user_id,
             StockTransaction.created_at >= start_datetime,
@@ -148,8 +151,9 @@ async def get_employee_history(
     )).all())
     # daily_sales is authoritative for sold quantity and financial snapshots. The
     # matching stock_transactions SALE row is deliberately not used as a sale event.
-    sale_rows = list((await session.scalars(
-        select(DailySale)
+    sale_rows = list((await session.execute(
+        select(DailySale, Product)
+        .join(Product, Product.id == DailySale.product_id)
         .where(
             DailySale.user_id == user_id,
             DailySale.created_at >= start_datetime,
@@ -164,23 +168,26 @@ async def get_employee_history(
             name=name,
             variant=variant,
             unit=unit,
+            stock_unit=stock_unit or "",
             opening_stock=int(quantity),
         )
-        for product_id, quantity, name, variant, unit in opening_rows
+        for product_id, quantity, name, variant, unit, stock_unit in opening_rows
     }
 
-    def product_for(row) -> ProductHistory:
-        name, variant, unit = _snapshot(row)
+    def product_for(row, product: Product) -> ProductHistory:
+        name, variant, unit, stock_unit = _snapshot(row, product)
         item = products.get(row.product_id)
         if item is None:
-            item = ProductHistory(row.product_id, name, variant, unit)
+            item = ProductHistory(row.product_id, name, variant, unit, stock_unit)
             products[row.product_id] = item
         elif row.product_name_snapshot:
             item.name, item.variant, item.unit = name, variant, unit
+        if stock_unit:
+            item.stock_unit = stock_unit
         return item
 
-    for row in stock_rows:
-        item = product_for(row)
+    for row, product in stock_rows:
+        item = product_for(row, product)
         quantity = int(row.quantity)
         if row.transaction_type == TransactionType.IMPORT:
             item.import_qty += quantity
@@ -189,8 +196,8 @@ async def get_employee_history(
             item.adjustment_qty += quantity
             item.events.append(HistoryEvent("ADJUSTMENT", quantity, as_vietnam_time(row.created_at)))
 
-    for row in sale_rows:
-        item = product_for(row)
+    for row, product in sale_rows:
+        item = product_for(row, product)
         quantity = int(row.quantity_sold)
         item.sale_qty += quantity
         item.revenue += int(row.revenue)
@@ -198,7 +205,7 @@ async def get_employee_history(
         item.events.append(HistoryEvent("SALE", -quantity, as_vietnam_time(row.created_at)))
 
     stock_delta: dict[int, int] = {}
-    for row in stock_rows:
+    for row, _product in stock_rows:
         stock_delta[row.product_id] = stock_delta.get(row.product_id, 0) + int(row.quantity)
     for item in products.values():
         item.closing_stock = item.opening_stock + stock_delta.get(item.product_id, 0)
