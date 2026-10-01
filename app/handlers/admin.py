@@ -14,7 +14,9 @@ from app.keyboards.admin import admin_menu
 from app.models import AdminAuditLog, AdminPayment, AdminPaymentStatus, CommissionType, DailySale, Deposit, Inventory, PaymentReminderSchedule, Product, StockTransaction, User, UserProductCommission, UserRole, Wallet, WalletTransaction
 from app.services.admin_payment_service import (amount_due_to_receiver, confirm_manual_settlement,
     create_admin_payment, create_settlement, get_payment_receiver, mark_admin_link_created,
-    daily_settlement, paid_admin_total, paid_between, personal_company_total, received_from_staff_total)
+    daily_settlement, debt_summary_to_receiver, paid_admin_total, paid_between, personal_company_total,
+    received_from_staff_total)
+from app.services.debt_adjustment_service import can_reset_debt, reset_debt, reset_history
 from app.services.payos_service import create_admin_payment_link, payos_is_configured
 from app.services.product_service import all_products, delete_or_hide_product, split_size, validate_stock_unit
 from app.services.shipping_service import get_shipping_total, vietnam_today
@@ -88,7 +90,9 @@ async def user_details(user: User, session: AsyncSession) -> str:
         func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user.id))).one()
     shipping = await get_shipping_total(session, user.id)
-    amount_due = max(0, int(company) - shipping)
+    gross_due = max(0, int(company) - shipping)
+    receiver = await get_payment_receiver(session, user)
+    debt = await debt_summary_to_receiver(session, user, receiver) if receiver else None
     stock_types = await session.scalar(select(func.count(Inventory.id)).where(
         Inventory.user_id == user.id, Inventory.current_quantity > 0
     ))
@@ -125,7 +129,10 @@ async def user_details(user: User, session: AsyncSession) -> str:
         f"\nDoanh thu: {format_money(int(revenue))}"
         f"\nHoa hồng: {format_money(int(commission))}"
         f"\n🚚 Tiền ship: {format_money(shipping)}"
-        f"\nPhải nộp: {format_money(amount_due)}"
+        f"\nPhải nộp gốc: {format_money(debt.gross_due if debt else gross_due)}"
+        f"\nĐã nộp: {format_money(debt.paid if debt else 0)}"
+        f"\nĐã reset công nợ: {format_money(debt.adjusted if debt else 0)}"
+        f"\nCòn phải nộp: {format_money(debt.outstanding if debt else 0)}"
         f"\nSố loại đang còn tồn: {int(stock_types or 0)}"
         f"\n\nLịch sử ví gần nhất:\n{history_text}"
         f"\n\nLịch sử nạp gần nhất:\n{deposit_text}"
@@ -154,12 +161,17 @@ async def employee_totals(session: AsyncSession, user_id: int) -> dict[str, int]
         func.coalesce(func.sum(DailySale.commission_amount), 0), func.coalesce(func.sum(DailySale.company_amount), 0),
     ).where(DailySale.user_id == user_id))).one()
     shipping = await get_shipping_total(session, user_id)
+    user = await session.get(User, user_id)
+    receiver = await get_payment_receiver(session, user) if user else None
+    debt = await debt_summary_to_receiver(session, user, receiver) if user and receiver else None
     return {"revenue": int(revenue), "commission": int(commission), "shipping": shipping,
-            "company": max(0, int(company) - shipping)}
+            "company": max(0, int(company) - shipping), "paid": debt.paid if debt else 0,
+            "adjusted": debt.adjusted if debt else 0, "outstanding": debt.outstanding if debt else 0}
 
 
 async def group_totals(session: AsyncSession, users: list[User]) -> dict[str, int]:
-    total = {"revenue": 0, "commission": 0, "shipping": 0, "company": 0}
+    total = {"revenue": 0, "commission": 0, "shipping": 0, "company": 0,
+             "paid": 0, "adjusted": 0, "outstanding": 0}
     for user in users:
         values = await employee_totals(session, user.id)
         for key in total: total[key] += values[key]
@@ -170,7 +182,9 @@ def group_text(users: list[User], total: dict[str, int]) -> str:
     return ("📊 TỔNG HỢP NHÓM\n\n" f"Nhân viên: {len(users)}\n\n"
             f"Tổng doanh thu: {format_money(total['revenue'])}\nTổng hoa hồng: {format_money(total['commission'])}\n\n"
             f"Tổng tiền ship: {format_money(total['shipping'])}\n"
-            f"💵 Tổng tiền cần nộp Admin tổng: {format_money(total['company'])}")
+            f"Tổng đã nộp: {format_money(total['paid'])}\n"
+            f"Tổng đã reset: {format_money(total['adjusted'])}\n"
+            f"💵 Tổng còn phải nộp: {format_money(total['outstanding'])}")
 
 
 def super_admin_keyboard() -> InlineKeyboardMarkup:
@@ -389,6 +403,8 @@ async def role_action(callback: CallbackQuery, session: AsyncSession, settings: 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👥 Xem nhân viên", callback_data=f"roles:team:{target.id}")],
             [InlineKeyboardButton(text="💸 Lịch sử nộp tiền", callback_data=f"roles:payments:{target.id}")],
+            [InlineKeyboardButton(text="🔄 Reset công nợ về 0", callback_data=f"debtreset:ask:{target.id}")],
+            [InlineKeyboardButton(text="📜 Lịch sử reset công nợ", callback_data=f"debtreset:history:{target.id}")],
             [InlineKeyboardButton(text="⬅️ Quay lại", callback_data="roles:list:admins:0")],
         ])
         text = (f"👑 {target.display_name.upper()}\n\nNhân viên: {len(users)}\n"
@@ -894,11 +910,14 @@ async def team_user_detail(callback: CallbackQuery, session: AsyncSession, setti
     t = await employee_totals(session, user.id)
     text = (f"👤 {user.display_name.upper()}\n\nDoanh thu: {format_money(t['revenue'])}\n"
             f"Hoa hồng: {format_money(t['commission'])}\nTiền ship: {format_money(t['shipping'])}\n"
-            f"Còn lại trả: {format_money(t['company'])}")
+            f"Phải nộp gốc: {format_money(t['company'])}\nĐã nộp: {format_money(t['paid'])}\n"
+            f"Đã reset công nợ: {format_money(t['adjusted'])}\nCòn phải nộp: {format_money(t['outstanding'])}")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Chi tiết hàng", callback_data=f"team:stock:{user.id}")],
         [InlineKeyboardButton(text="💰 Xem hoa hồng", callback_data=f"comm:user:{user.id}")],
         [InlineKeyboardButton(text="📜 Lịch sử theo ngày", callback_data=f"hist:m:{user.id}:t")],
+        [InlineKeyboardButton(text="🔄 Reset công nợ về 0", callback_data=f"debtreset:ask:{user.id}")],
+        [InlineKeyboardButton(text="📜 Lịch sử reset công nợ", callback_data=f"debtreset:history:{user.id}")],
     ])
     await callback.message.edit_text(text, reply_markup=keyboard); await callback.answer()
 
@@ -907,6 +926,133 @@ async def authorized_team_user(callback: CallbackQuery, session: AsyncSession, u
     actor = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
     employee = await session.get(User, user_id)
     return employee if actor and employee and can_manage_employee(actor, employee) else None
+
+
+def debt_reset_back_callback(actor: User, target: User) -> str:
+    if actor.role == UserRole.SUPER_ADMIN and target.role == UserRole.ADMIN:
+        return f"roles:do:admins:{target.id}"
+    return f"team:user:{target.id}"
+
+
+async def authorized_debt_reset(
+    callback: CallbackQuery, session: AsyncSession, target_id: int
+) -> tuple[User, User, User] | None:
+    actor = await session.scalar(select(User).where(
+        User.telegram_id == callback.from_user.id,
+        User.is_deleted.is_(False),
+    ))
+    target = await session.get(User, target_id)
+    if not can_reset_debt(actor, target):
+        return None
+    receiver = await get_payment_receiver(session, target)
+    if receiver is None:
+        return None
+    return actor, target, receiver
+
+
+@router.callback_query(F.data.regexp(r"^debtreset:ask:\d+$"))
+async def debt_reset_ask(callback: CallbackQuery, session: AsyncSession) -> None:
+    target_id = int(callback.data.rsplit(":", 1)[1])
+    authorized = await authorized_debt_reset(callback, session, target_id)
+    if not authorized:
+        return await callback.answer("Bạn không có quyền reset công nợ tài khoản này.", show_alert=True)
+    actor, target, receiver = authorized
+    debt = await debt_summary_to_receiver(session, target, receiver)
+    back = debt_reset_back_callback(actor, target)
+    if debt.outstanding <= 0:
+        await callback.message.edit_text(
+            f"✅ Công nợ của {target.display_name} hiện đã là 0đ.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Quay lại", callback_data=back)
+            ]]),
+        )
+        return await callback.answer()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Xác nhận reset", callback_data=f"debtreset:confirm:{target.id}")],
+        [InlineKeyboardButton(text="❌ Hủy", callback_data=f"debtreset:cancel:{target.id}")],
+    ])
+    await callback.message.edit_text(
+        "⚠️ XÁC NHẬN RESET CÔNG NỢ\n\n"
+        f"Nhân viên:\n{target.display_name}\n\n"
+        f"Còn phải nộp hiện tại:\n{format_money(debt.outstanding)}\n\n"
+        "Sau khi reset:\n0đ\n\n"
+        "Thao tác này không xóa lịch sử doanh thu và thanh toán.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^debtreset:confirm:\d+$"))
+async def debt_reset_confirm(callback: CallbackQuery, session: AsyncSession) -> None:
+    target_id = int(callback.data.rsplit(":", 1)[1])
+    authorized = await authorized_debt_reset(callback, session, target_id)
+    if not authorized:
+        return await callback.answer("Bạn không có quyền reset công nợ tài khoản này.", show_alert=True)
+    actor, target, _receiver = authorized
+    try:
+        result = await reset_debt(session, actor, target)
+    except (PermissionError, ValueError) as exc:
+        return await callback.answer(str(exc), show_alert=True)
+    back = debt_reset_back_callback(actor, target)
+    if not result.created:
+        await callback.message.edit_text(
+            f"✅ Công nợ của {target.display_name} hiện đã là 0đ.\n\nKhông tạo thêm bút toán điều chỉnh.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Quay lại", callback_data=back)
+            ]]),
+        )
+        return await callback.answer("Công nợ đã bằng 0đ.")
+    await callback.message.edit_text(
+        f"✅ ĐÃ RESET CÔNG NỢ\n\nNhân viên: {target.display_name}\n"
+        f"Số tiền đã điều chỉnh: {format_money(result.amount)}\nCòn phải nộp: 0đ\n\n"
+        "Doanh thu, hoa hồng, tiền ship và lịch sử thanh toán vẫn được giữ nguyên.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📜 Lịch sử reset", callback_data=f"debtreset:history:{target.id}")],
+            [InlineKeyboardButton(text="⬅️ Quay lại", callback_data=back)],
+        ]),
+    )
+    await callback.answer("Đã reset công nợ về 0đ.")
+
+
+@router.callback_query(F.data.regexp(r"^debtreset:cancel:\d+$"))
+async def debt_reset_cancel(callback: CallbackQuery, session: AsyncSession) -> None:
+    target_id = int(callback.data.rsplit(":", 1)[1])
+    authorized = await authorized_debt_reset(callback, session, target_id)
+    if not authorized:
+        return await callback.answer("Bạn không có quyền thao tác tài khoản này.", show_alert=True)
+    actor, target, _receiver = authorized
+    await callback.message.edit_text(
+        "Đã hủy reset công nợ.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Quay lại", callback_data=debt_reset_back_callback(actor, target))
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^debtreset:history:\d+$"))
+async def debt_reset_history(callback: CallbackQuery, session: AsyncSession) -> None:
+    target_id = int(callback.data.rsplit(":", 1)[1])
+    authorized = await authorized_debt_reset(callback, session, target_id)
+    if not authorized:
+        return await callback.answer("Bạn không có quyền xem lịch sử này.", show_alert=True)
+    actor, target, _receiver = authorized
+    rows = await reset_history(session, target.id)
+    lines: list[str] = []
+    for item in rows:
+        creator = await session.get(User, item.created_by_user_id)
+        lines.append(
+            f"• {item.created_at:%d/%m/%Y %H:%M}\n"
+            f"  {creator.display_name if creator else 'Không xác định'} đã reset {format_money(item.amount)}"
+        )
+    text = "\n\n".join(lines) or "Chưa có lần reset công nợ nào."
+    await callback.message.edit_text(
+        f"📜 LỊCH SỬ RESET CÔNG NỢ\n\nNhân viên: {target.display_name}\n\n{text}"[:4000],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Quay lại", callback_data=debt_reset_back_callback(actor, target))
+        ]]),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("team:stock:"))
@@ -949,6 +1095,7 @@ async def admin_payment_preview(message: Message, session: AsyncSession, setting
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await message.answer("Không tìm thấy Admin tổng nhận tiền.")
     day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
+    debt = await debt_summary_to_receiver(session, actor, receiver)
     personal_due = max(0, summary.revenue - summary.commission - summary.shipping)
     staff_received = max(0, summary.due - personal_due)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -958,17 +1105,19 @@ async def admin_payment_preview(message: Message, session: AsyncSession, setting
         [InlineKeyboardButton(text="📜 Lịch sử nộp hôm nay", callback_data="settlement:history")],
         [InlineKeyboardButton(text="❌ Hủy", callback_data="adminpay:cancel")],
     ])
-    if summary.remaining == 0:
+    if debt.outstanding == 0:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📜 Lịch sử nộp hôm nay", callback_data="settlement:history")
         ]])
-    complete = "\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if summary.remaining == 0 else ""
+    complete = "\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if debt.outstanding == 0 else ""
     await message.answer("💸 NỘP TIỀN ADMIN TỔNG\n\n"
         f"📅 Ngày {day:%d/%m/%Y}\n\nDoanh thu cá nhân: {format_money(summary.revenue)}\n"
         f"Hoa hồng: {format_money(summary.commission)}\nTiền ship: {format_money(summary.shipping)}\n"
         f"Tiền cá nhân phải nộp: {format_money(personal_due)}\n"
         f"Tiền đã thu từ nhân viên: {format_money(staff_received)}\n\n"
-        f"Đã nộp Admin tổng: {format_money(summary.paid)}\nCòn lại: {format_money(summary.remaining)}{complete}", reply_markup=keyboard)
+        f"Đã nộp Admin tổng: {format_money(debt.paid)}\n"
+        f"Đã reset công nợ: {format_money(debt.adjusted)}\n"
+        f"Còn lại: {format_money(debt.outstanding)}{complete}", reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("adminpay:create:"))
@@ -978,9 +1127,9 @@ async def admin_payment_create(callback: CallbackQuery, session: AsyncSession, s
     if not payos_is_configured(settings): return await callback.answer("payOS chưa được cấu hình.", show_alert=True)
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await callback.answer("Không tìm thấy Admin tổng.", show_alert=True)
-    day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
+    day = vietnam_today(); debt = await debt_summary_to_receiver(session, actor, receiver)
     raw_amount = callback.data.rsplit(":", 1)[1]
-    due = summary.remaining if raw_amount == "all" else min(summary.remaining, int(raw_amount))
+    due = debt.outstanding if raw_amount == "all" else min(debt.outstanding, int(raw_amount))
     try:
         item = await create_admin_payment(session, actor.id, due, receiver.id)
         item.settlement_date = day; await session.commit()
@@ -1011,6 +1160,7 @@ async def user_settlement_preview(message: Message, session: AsyncSession, setti
     receiver = await get_payment_receiver(session, actor)
     if not receiver: return await message.answer("Không tìm thấy người nhận tiền.")
     day = vietnam_today(); summary = await daily_settlement(session, actor, receiver, day)
+    debt = await debt_summary_to_receiver(session, actor, receiver)
     if actor.manager_admin_id:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"💸 Nộp tiền cho {receiver.display_name}", callback_data="settlement:manual:create")
@@ -1024,16 +1174,17 @@ async def user_settlement_preview(message: Message, session: AsyncSession, setti
             [InlineKeyboardButton(text="📜 Lịch sử nộp hôm nay", callback_data="settlement:history")],
         ])
         receiver_label = "Admin tổng"
-    if summary.remaining == 0:
+    if debt.outstanding == 0:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📜 Lịch sử nộp hôm nay", callback_data="settlement:history")
         ]])
     await message.answer(f"💰 QUYẾT TOÁN NGÀY {day:%d/%m/%Y}\n\n"
                          f"Doanh thu: {format_money(summary.revenue)}\nHoa hồng: {format_money(summary.commission)}\n\n"
                          f"Tiền ship: {format_money(summary.shipping)}\n"
-                         f"Phải nộp: {format_money(summary.due)}\nĐã nộp: {format_money(summary.paid)}\n"
-                         f"Còn lại: {format_money(summary.remaining)}\n"
-                         f"Người nhận: {receiver_label}" + ("\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if summary.remaining == 0 else ""), reply_markup=keyboard)
+                         f"Phải nộp: {format_money(summary.due)}\nĐã nộp: {format_money(debt.paid)}\n"
+                         f"Đã reset công nợ: {format_money(debt.adjusted)}\n"
+                         f"Còn lại: {format_money(debt.outstanding)}\n"
+                         f"Người nhận: {receiver_label}" + ("\n\n✅ ĐÃ HOÀN TẤT QUYẾT TOÁN" if debt.outstanding == 0 else ""), reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "settlement:manual:create")
@@ -1048,7 +1199,7 @@ async def create_manual_settlement(callback: CallbackQuery, session: AsyncSessio
     ).order_by(AdminPayment.created_at.desc()))
     if existing:
         return await callback.answer("Giao dịch đang chờ quản lý xác nhận.", show_alert=True)
-    summary = await daily_settlement(session, payer, receiver, vietnam_today()); due = summary.remaining
+    debt = await debt_summary_to_receiver(session, payer, receiver); due = debt.outstanding
     try: item = await create_settlement(session, payer.id, receiver.id, due, payment_method="MANUAL")
     except ValueError as exc: return await callback.answer(str(exc), show_alert=True)
     await callback.message.edit_text("⏳ CHỜ THANH TOÁN\n\n"
@@ -1069,9 +1220,9 @@ async def create_user_payos_settlement(callback: CallbackQuery, session: AsyncSe
     if not payer or payer.role != UserRole.USER or payer.manager_admin_id is not None: return await deny(callback)
     receiver = await get_payment_receiver(session, payer)
     if not receiver: return await callback.answer("Không tìm thấy Admin tổng.", show_alert=True)
-    day = vietnam_today(); summary = await daily_settlement(session, payer, receiver, day)
+    day = vietnam_today(); debt = await debt_summary_to_receiver(session, payer, receiver)
     raw_amount = callback.data.rsplit(":", 1)[1]
-    due = summary.remaining if raw_amount == "all" else min(summary.remaining, int(raw_amount))
+    due = debt.outstanding if raw_amount == "all" else min(debt.outstanding, int(raw_amount))
     try:
         item = await create_settlement(session, payer.id, receiver.id, due, payment_method="PAYOS")
         link = await create_admin_payment_link(payos, settings, item)
@@ -1110,9 +1261,11 @@ async def staff_settlements(message: Message, session: AsyncSession, settings: S
     day = vietnam_today()
     for user in staff:
         summary = await daily_settlement(session, user, admin, day)
+        debt = await debt_summary_to_receiver(session, user, admin)
         lines.append(f"{user.display_name}\nTiền ship: {format_money(summary.shipping)}\n"
                      f"Phải nộp: {format_money(summary.due)}\n"
-                     f"Đã nộp: {format_money(summary.paid)}\nCòn: {format_money(summary.remaining)}")
+                     f"Đã nộp: {format_money(debt.paid)}\n"
+                     f"Đã reset: {format_money(debt.adjusted)}\nCòn: {format_money(debt.outstanding)}")
     pending = list((await session.scalars(select(AdminPayment).where(
         AdminPayment.receiver_user_id == admin.id, AdminPayment.payment_method == "MANUAL",
         AdminPayment.status == AdminPaymentStatus.PENDING,
@@ -1229,6 +1382,8 @@ async def user_action(callback: CallbackQuery, session: AsyncSession, settings: 
         text = await user_details(user, session)
         rows = [[InlineKeyboardButton(text="📜 Lịch sử theo ngày", callback_data=f"hist:m:{user.id}:a")]]
         if user.role != UserRole.SUPER_ADMIN and not user.is_deleted:
+            rows.append([InlineKeyboardButton(text="🔄 Reset công nợ về 0", callback_data=f"debtreset:ask:{user.id}")])
+            rows.append([InlineKeyboardButton(text="📜 Lịch sử reset công nợ", callback_data=f"debtreset:history:{user.id}")])
             rows.append([InlineKeyboardButton(text="🗑 Xóa người dùng", callback_data=f"softdelete:ask:{user.id}")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         await callback.message.edit_text(text, reply_markup=keyboard)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import Enum
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -48,6 +48,10 @@ class AdminPaymentStatus(str, Enum):
     PENDING = "PENDING"
     PAID = "PAID"
     CANCELLED = "CANCELLED"
+
+
+class PaymentAdjustmentType(str, Enum):
+    DEBT_RESET = "DEBT_RESET"
 
 
 class User(Base):
@@ -268,6 +272,25 @@ class AdminPayment(Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class PaymentAdjustment(Base):
+    __tablename__ = "payment_adjustments"
+    __table_args__ = (CheckConstraint("amount > 0", name="ck_payment_adjustment_positive_amount"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    receiver_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    adjustment_type: Mapped[PaymentAdjustmentType] = mapped_column(
+        SqlEnum(PaymentAdjustmentType), default=PaymentAdjustmentType.DEBT_RESET,
+        server_default="DEBT_RESET", index=True,
+    )
+    business_date: Mapped[date] = mapped_column(Date, index=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=func.now(), index=True)
+
+
 class PaymentReminderSchedule(Base):
     __tablename__ = "payment_reminder_schedules"
     __table_args__ = (UniqueConstraint("hour", "minute", name="uq_payment_reminder_time"),)
@@ -316,7 +339,7 @@ class AdminAuditLog(Base):
 
 __all__ = [
     "AdminAuditLog", "AdminPayment", "AdminPaymentStatus", "Base", "CommissionType", "DailySale", "DailyShippingFee", "Deposit", "DepositStatus", "UserProductCommission",
-    "Inventory", "PaymentEvent", "PaymentOrderSequence", "PaymentReminderDelivery", "PaymentReminderSchedule", "Product", "StockTransaction",
+    "Inventory", "PaymentAdjustment", "PaymentAdjustmentType", "PaymentEvent", "PaymentOrderSequence", "PaymentReminderDelivery", "PaymentReminderSchedule", "Product", "StockTransaction",
     "TransactionType", "User", "Wallet", "WalletTransaction",
     "UserRole", "WalletTransactionType",
 ]

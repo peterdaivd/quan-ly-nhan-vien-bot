@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import event, inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from app.models import Base, DailySale, DailyShippingFee, Deposit, Product, StockTransaction, User, WalletTransaction
+from app.models import Base, DailySale, DailyShippingFee, Deposit, PaymentAdjustment, Product, StockTransaction, User, WalletTransaction
 
 
 def create_database(database_url: str) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -24,6 +24,7 @@ async def initialize_database(engine: AsyncEngine, super_admin_ids: frozenset[in
         await connection.run_sync(_migrate_product_catalog)
         await connection.run_sync(_migrate_product_stock_units)
         await connection.run_sync(_create_daily_shipping_fees)
+        await connection.run_sync(_create_payment_adjustments)
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_migrate_user_roles)
         await connection.run_sync(_migrate_commissions)
@@ -294,3 +295,8 @@ def _migrate_product_stock_units(connection) -> None:
 def _create_daily_shipping_fees(connection) -> None:
     """Additive, idempotent migration: only creates the new shipping table/indexes."""
     DailyShippingFee.__table__.create(connection, checkfirst=True)
+
+
+def _create_payment_adjustments(connection) -> None:
+    """Additive, idempotent migration for immutable debt-reset entries."""
+    PaymentAdjustment.__table__.create(connection, checkfirst=True)

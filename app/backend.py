@@ -20,7 +20,7 @@ from app.services.deposit_service import (
     expire_pending_deposits, process_successful_deposit,
 )
 from app.models import AdminPayment, AdminPaymentStatus, PaymentReminderDelivery, PaymentReminderSchedule, User, UserRole
-from app.services.admin_payment_service import daily_settlement, get_payment_receiver, process_successful_admin_payment
+from app.services.admin_payment_service import daily_settlement, debt_summary_to_receiver, get_payment_receiver, process_successful_admin_payment
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.services.payos_service import payment_data_dict
 from app.utils.money import format_money
@@ -156,12 +156,14 @@ def create_backend_app(
                                 receiver = await get_payment_receiver(session, user)
                                 if not receiver: continue
                                 summary = await daily_settlement(session, user, receiver, day)
-                                if summary.remaining <= 0: continue
+                                debt = await debt_summary_to_receiver(session, user, receiver)
+                                if debt.outstanding <= 0: continue
                                 receiver_name = "Admin tổng" if receiver.role == UserRole.SUPER_ADMIN else receiver.display_name
                                 text = (f"⏰ NHẮC NỘP TIỀN\n\n📅 Ngày {day:%d/%m/%Y}\n\n"
                                         f"🚚 Tiền ship: {format_money(summary.shipping)}\n"
-                                        f"💵 Phải nộp: {format_money(summary.due)}\n✅ Đã nộp: {format_money(summary.paid)}\n"
-                                        f"⏳ Còn lại: {format_money(summary.remaining)}\n\nNgười nhận: {receiver_name}\n\n"
+                                        f"💵 Phải nộp: {format_money(summary.due)}\n✅ Đã nộp: {format_money(debt.paid)}\n"
+                                        f"🔄 Đã reset: {format_money(debt.adjusted)}\n"
+                                        f"⏳ Còn lại: {format_money(debt.outstanding)}\n\nNgười nhận: {receiver_name}\n\n"
                                         f"Vui lòng hoàn tất nộp tiền cho {receiver_name}.")
                                 callback_data = "settlement:manual:create" if user.manager_admin_id else "settlement:payos:create:all"
                                 try:

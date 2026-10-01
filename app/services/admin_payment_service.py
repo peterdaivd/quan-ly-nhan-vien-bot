@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AdminPayment, AdminPaymentStatus, DailySale, PaymentEvent, User
+from app.services.debt_adjustment_service import adjustment_total
 from app.services.deposit_service import generate_order_code
 from app.services.shipping_service import get_shipping_total, vietnam_today
 
@@ -35,6 +36,7 @@ class DailySettlement:
     shipping: int
     due: int
     paid: int
+    adjusted: int
     remaining: int
 
 
@@ -46,6 +48,14 @@ class SettlementTotals:
     commission: int
     shipping: int
     due: int
+
+
+@dataclass(frozen=True)
+class DebtSummary:
+    gross_due: int
+    paid: int
+    adjusted: int
+    outstanding: int
 
 
 async def get_payment_receiver(session: AsyncSession, user: User) -> User | None:
@@ -97,10 +107,16 @@ async def received_from_staff_total(session: AsyncSession, admin_user_id: int) -
 
 
 async def amount_due_to_receiver(session: AsyncSession, user: User, receiver: User) -> int:
+    return (await debt_summary_to_receiver(session, user, receiver)).outstanding
+
+
+async def debt_summary_to_receiver(session: AsyncSession, user: User, receiver: User) -> DebtSummary:
     gross = await personal_company_total(session, user.id)
     if user.role.value == "ADMIN":
         gross += await received_from_staff_total(session, user.id)
-    return max(0, gross - await paid_between(session, user.id, receiver.id))
+    paid = await paid_between(session, user.id, receiver.id)
+    adjusted = await adjustment_total(session, user.id, receiver.id)
+    return DebtSummary(gross, paid, adjusted, max(0, gross - paid - adjusted))
 
 
 async def create_settlement(
@@ -168,9 +184,10 @@ async def daily_settlement(session: AsyncSession, user: User, receiver: User, da
         AdminPayment.payer_user_id == user.id, AdminPayment.receiver_user_id == receiver.id,
         AdminPayment.status == AdminPaymentStatus.PAID, AdminPayment.settlement_date == day,
     )) or 0)
+    adjusted = await adjustment_total(session, user.id, receiver.id, day, day)
     return DailySettlement(
         day, personal.revenue, personal.commission, personal.shipping,
-        due, paid, max(0, due - paid),
+        due, paid, adjusted, max(0, due - paid - adjusted),
     )
 
 
@@ -214,8 +231,8 @@ async def process_successful_admin_payment(
     item.paid_at = datetime.now()
     admin = await session.get(User, item.payer_user_id or item.admin_user_id)
     receiver = await session.get(User, item.receiver_user_id) if item.receiver_user_id else None
-    summary = await daily_settlement(session, admin, receiver, item.settlement_date or vietnam_today()) if admin and receiver else None
-    outstanding = summary.remaining if summary else 0
+    summary = await debt_summary_to_receiver(session, admin, receiver) if admin and receiver else None
+    outstanding = summary.outstanding if summary else 0
     await session.commit()
     return AdminPaymentResult(outcome="PAID", admin_payment_id=item.id,
                               admin_telegram_id=admin.telegram_id if admin else None,
